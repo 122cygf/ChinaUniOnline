@@ -6,7 +6,8 @@
 
 ## 用法
 
-没有提供可执行程序，安装完成依赖后执行`python main-gui.py`即可。在Python 3.9.2版本上实验通过，可以运行。纯GUI程序，Linux下运行需要正常的桌面环境。
+~~没有提供可执行程序，安装完成依赖后执行`python main-gui.py`即可。~~ 在Python 3.9.2版本上实验通过，可以运行。纯GUI程序，Linux下运行需要正常的桌面环境。  
+已加入启动脚本，安装完成依赖后Windows请双击执行`start.vbs`，Linux/OS X请执行`start.sh`
 
 ## 关闭网页登陆后的处理方法
 
@@ -22,7 +23,7 @@
 
 方法1：在上面第 6 步的请求参数中uid参数的值就是所需的UID。有UID的情况下优先使用UID获取Token完成登陆  
 方法2：找到 <https://ssxx.univs.cn/cgi-bin/portal/user/> 的GET记录，带有参数t，响应预览的data下的id的值也是UID  
-上面的方法选择一个即可
+上面的方法选择一个即可  
 
 ## 注意
 

@@ -1,7 +1,6 @@
 import os
 import io
 import sys
-import sqlite3
 import json
 import base64
 import random
@@ -13,10 +12,12 @@ import requests
 import ctypes
 import numpy
 from matplotlib import pyplot as plt 
+from matplotlib import use as matplotuse
 from urllib import parse
 from PyQt6 import QtGui
 from PyQt6.QtGui import QAction, QIcon, QMouseEvent, QPixmap, QRegularExpressionValidator
 from PyQt6.QtCore import QObject, QRegularExpression, QThread, Qt, pyqtBoundSignal, pyqtSignal
+from PyQt6.QtSql import QSqlDatabase, QSqlQuery
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5 as Cipher
 from PyQt6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget, QSystemTrayIcon, QDockWidget, QMainWindow
@@ -26,6 +27,11 @@ os.chdir(os.path.split(os.path.realpath(__file__))[0])
 # 将工作目录转移到脚本所在目录，保证下面的相对路径都能正确找到文件
 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ChinaUniOnlineGUI")
 # 让任务栏图标可以正常显示
+matplotuse("Agg")
+# 让matplotlib使用Agg后端避免Tkinter在非主线程运行的问题
+class SQLException(Exception):
+    def __init__(self,*args):
+        super().__init__(*args)
 class EnhancedLabel(QLabel):
     # 一个可以在被单击时发送信号的标签
     clicked=pyqtSignal()
@@ -139,7 +145,16 @@ class QLogger(logging.Handler):
     def scroll_widget_to_bottom(self):
         self.widget.verticalScrollBar().setSliderPosition(self.widget.verticalScrollBar().maximum())
 class TestProcessor():
-    def __init__(self,show_qr_signal:pyqtBoundSignal,close_qr_signal:pyqtBoundSignal,user_info_signal:pyqtBoundSignal,update_info_signal:pyqtBoundSignal):
+    def __init__(self,show_qr_signal:pyqtBoundSignal,close_qr_signal:pyqtBoundSignal,user_info_signal:pyqtBoundSignal,update_info_signal:pyqtBoundSignal,prefix:str="ssxx"):
+        '''答题处理器
+        进行自动化答题的处理器类
+        参数:
+            show_qr_signal(pyqtBoundSgnal):PyQt信号，传递二维码的Bytes用于OAuth登陆，现由于OAuth被服务器废弃，仅保留作为兼容
+            close_qr_signal(pyqtBoundSgnal):PyQt信号，无传递数据，用于告诉UI主进程已完成登陆，关闭二维码的显示，现状同上
+            user_info_signal(pyqtBoundSgnal):PyQt信号，传递用户数据的dict用于生成用户信息Widget
+            update_info_signal(pyqtBoundSgnal):PyQt信号，传递用户数据的dict用于更新用户信息
+            prefix(str):文本，用于标记比赛类型是传统的四史还是新的党史，默认为 ssxx 代表四史，dsjd 代表党史，同时也是区分相关URL的前缀
+        '''
         self.logger=logging.getLogger(__name__)
         self.expire=0
         with open(file="config.json",mode="r",encoding="utf-8") as conf_reader:
@@ -148,6 +163,7 @@ class TestProcessor():
         self.close_qr_signal=close_qr_signal
         self.user_info_signal=user_info_signal
         self.update_info_signal=update_info_signal
+        self.prefix=prefix
         self.session=requests.sessions.session()
         default_headers={
             "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.182 Safari/537.36 Edg/88.0.705.74",
@@ -161,18 +177,28 @@ class TestProcessor():
         proxy=self.conf["proxy"]
         if proxy!="":
             self.session.proxies.update({"http":proxy,"https":proxy})
-        self.activity_id="5f71e934bcdbf3a8c3ba5061"
+        if self.prefix=="ssxx":
+            self.activity_id="5f71e934bcdbf3a8c3ba5061"
+        elif self.prefix=="dsjd":
+            self.activity_id="603dda8ce4c8f6da7d923897"
+        else:
+            self.logger.error("非法的比赛类型")
+            raise ValueError("非法的比赛类型")
         self.client="5f582dd3683c2e0ae3aaacee"
         self.login()
         params={"t":str(int(time.time())),"id":self.activity_id}
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/portal/activity/",params=params).json()
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/portal/activity/" %self.prefix,params=params).json()
         self.activity_id=json_response["data"]["id"]
         params={"t":str(int(time.time())),"activity_id":self.activity_id}
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/portal/race/mode/",params=params).json()
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/portal/race/mode/" %self.prefix,params=params).json()
         modes=json_response["data"]["modes"]
         self.ids={}
         for mode in modes:
             self.ids[mode["id"]]={"title":mode["title"],"enabled":self.is_enabled(title=mode["title"]),"times":self.times(title=mode["title"])}
+        if self.prefix=="ssxx":
+            self.logger.info("已准备处理四史学习内容")
+        elif self.prefix=="dsjd":
+            self.logger.info("已准备处理党史活动内容")
     def login(self,keep_referer:bool=False,type_:str="v1"):
         if keep_referer==True:
             referer={"Referer":self.session.headers["Referer"]}
@@ -222,7 +248,7 @@ class TestProcessor():
                         username=json_response["data"]["data"]["username"] # zhanghua
                         self.token=json_response["data"]["data"]["token"]
                         params={"t":str(int(time.time())),"uid":_id}
-                        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/authorize/token/",params=params).json()
+                        json_response=self.session.get("https://%s.univs.cn/cgi-bin/authorize/token/" %self.prefix,params=params).json()
                         self.token=json_response["token"]
                         self.refresh_token=json_response["refresh_token"]
                         self.logger.info("用户 %s 登陆成功" %(username))
@@ -239,12 +265,12 @@ class TestProcessor():
             self.logger.debug("使用模拟手机微信登陆")
             new_headers={
                 "User-Agent":"Mozilla/5.0 (Linux; Android 10; BKL-AL20 Build/HUAWEIBKL-AL20; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/78.0.3904.62 XWEB/2759 MMWEBSDK/201201 Mobile Safari/537.36 MMWEBID/1494 MicroMessenger/8.0.1.1841(0x28000151) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram",
-                "Referer":"https://ssxx.univs.cn/client/detail/%s" %self.activity_id,
+                "Referer":"https://%s.univs.cn/client/detail/%s" %(self.prefix,self.activity_id),
                 "X-Requested-With":"com.tencent.mm",
                 "Accept-Encoding":"gzip, deflate"
             }
             self.session.headers.update(new_headers)
-            json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/authorize/token/",params={"t":int(time.time())}).json()
+            json_response=self.session.get("https://%s.univs.cn/cgi-bin/authorize/token/" %self.prefix,params={"t":int(time.time())}).json()
             self.logger.debug("服务器返回数据：%s" %json_response)
             if json_response["code"]==1102:
                 self.session.headers.update({"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/wxpic,image/tpg,image/apng,*/*;q=0.8,application/signed-exchange;v=b3"})
@@ -271,9 +297,9 @@ class TestProcessor():
                 resp=self.session.get("https://open.weixin.qq.com/connect/oauth2/authorize_reply",params={"allow":1,"snap_userinfo":"on","uuid":wx_data["uuid"],"uin":wx_data["uin"],"key":wx_data["key"],"pass_ticket":wx_data["pass_ticket"],"version":wx_data["version"]})
                 data=json.loads(parse.parse_qs(parse.urlparse(parse.unquote(resp.url)).query)["data"][0])
                 self.session.headers.update({"Referer":resp.url})
-                json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/base/public/key/",params={"t":int(time.time())}).json()
+                json_response=self.session.get("https://%s.univs.cn/cgi-bin/base/public/key/" %self.prefix,params={"t":int(time.time())}).json()
                 self.logger.debug("OAuth内容：%s" %data["oauth"])
-                json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/authorize/token/",params={"t":int(time.time()),"uid":wx_data["uid"],"activity_id":self.activity_id,"avatar":data["oauth"]["avatarUrl"]}).json()
+                json_response=self.session.get("https://%s.univs.cn/cgi-bin/authorize/token/" %self.prefix,params={"t":int(time.time()),"uid":wx_data["uid"],"activity_id":self.activity_id,"avatar":data["oauth"]["avatarUrl"]}).json()
             self.token=json_response["token"]
             self.refresh_token=json_response["refresh_token"]
         else:
@@ -287,12 +313,12 @@ class TestProcessor():
             else:
                 self.logger.info("使用存储的UID完成登陆")
                 params={"t":str(int(time.time())),"uid":self.uid}
-                json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/authorize/token/",params=params).json()
+                json_response=self.session.get("https://%s.univs.cn/cgi-bin/authorize/token/" %self.prefix,params=params).json()
                 self.token=json_response["token"]
                 self.refresh_token=json_response["refresh_token"]
         self.expire=self.decode_token()[self.token.split(".")[1]]["exp"]
         headers={
-            "Referer":"https://ssxx.univs.cn/clientLogin?redirect=/client/detail/%s" %self.activity_id,
+            "Referer":"https://%s.univs.cn/clientLogin?redirect=/client/detail/%s" %(self.prefix,self.activity_id),
             "Authorization":"Bearer %s" %self.token}
         self.session.headers.update(orig_headers)
         self.session.headers.update(headers)
@@ -301,10 +327,10 @@ class TestProcessor():
         if self.expire-time.time()<500:
             self.update_token()
         params={"t":str(int(time.time()))}
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/portal/user/",params=params).json()
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/portal/user/" %self.prefix,params=params).json()
         if json_response["code"]==1002:
             self.logger.error("Token已过期")
-            raise RuntimeError(json_response["message"])
+            raise RuntimeError(self.error_handler(json_response=json_response))
         self.logger.debug("获取用户信息：%s" %json_response)
         name=json_response["data"]["name"]
         university_name=json_response["data"]["university_name"]
@@ -313,20 +339,21 @@ class TestProcessor():
         self.logger.info("用户 %s 来自 %s，手机号 %s" %(name,university_name,zip_+" "+mobile))
         self.user_info=self.get_user_info()
         self.user_info.update({"name":name,"phone":zip_+" "+mobile})
-        self.session.headers.update({"Referer": "https://ssxx.univs.cn/client/detail/%s" %(self.activity_id)})
+        self.session.headers.update({"Referer": "https://%s.univs.cn/client/detail/%s" %(self.prefix,self.activity_id)})
         self.user_info_signal.emit(self.user_info)
         self.logger.debug("已提交用户数据")
     def get_user_info(self):
         orig_headers=self.session.headers
         avatar=None
-        self.session.headers.update({"Referer": "https://ssxx.univs.cn/client/detail/%s/score" %(self.activity_id)})
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/race/grade/",params={"t":int(time.time()),"activity_id":self.activity_id}).json()
+        self.session.headers.update({"Referer": "https://%s.univs.cn/client/detail/%s/score" %(self.prefix,self.activity_id)})
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/race/grade/" %self.prefix,params={"t":int(time.time()),"activity_id":self.activity_id}).json()
         self.logger.debug("服务器返回用户信息：%s" %json_response)
         if json_response["code"]==1005:
             self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
             raise RuntimeError("检测到此账号在其他客户端登陆")
         elif json_response["code"]!=0:
-            self.logger.error("服务器返回错误代码：%d，错误信息：%s" %(json_response["code"],json_response["message"]))
+            msg=self.error_handler(json_response=json_response)
+            self.logger.error("服务器返回错误代码：%d，错误信息：%s" %(json_response["code"],msg))
             raise RuntimeError("查询分数过程中服务器返回数据有误，查看日志获得更多信息")
         integral=json_response["data"]["integral"] # 分数
         join_times=json_response["data"]["join_times"] # 答题次数
@@ -334,13 +361,14 @@ class TestProcessor():
         t_integral=json_response["data"]["t_integral"] # 团队答题次数
         university_name=json_response["data"]["university_name"] # 学校名称
         province_name=json_response["data"]["province_name"] # 地区
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/user/race/fight/accuracy/",params={"t":int(time.time()),"activity_id":self.activity_id}).json()
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/user/race/fight/accuracy/" %self.prefix,params={"t":int(time.time()),"activity_id":self.activity_id}).json()
         self.logger.debug("获取用户答题准确率信息内容：%s" %json_response)
         if json_response["code"]==1005:
             self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
             raise RuntimeError("检测到此账号在其他客户端登陆")
         elif json_response["code"]!=0:
-            self.logger.error("服务器返回错误代码：%d，错误信息：%s" %(json_response["code"],json_response["message"]))
+            msg=self.error_handler(json_response=json_response)
+            self.logger.error("服务器返回错误代码：%d，错误信息：%s" %(json_response["code"],msg))
             raise RuntimeError("查询分数过程中服务器返回数据有误，查看日志获得更多信息")
         avatar=json_response["data"]
         self.session.headers.update(orig_headers)
@@ -355,17 +383,44 @@ class TestProcessor():
             if type(self.conf[key])==dict and "title" in self.conf[key] and "times" in self.conf[key] and self.conf[key]["title"]==title:
                 return int(self.conf[key]["times"])
         return 1
-    def start(self,tray:QSystemTrayIcon):
-        conn=sqlite3.connect("answers.db")
-        self.cur=conn.cursor()
+    def start(self,tray:QSystemTrayIcon,update_tray:pyqtBoundSignal,times:int=None):
+        if QSqlDatabase.contains("qt_sql_default_connection"):
+            db=QSqlDatabase.database("qt_sql_default_connection")
+        else:
+            db=QSqlDatabase.addDatabase("QSQLITE")
+        db.setDatabaseName("answers.db")
+        if db.open()==False:
+            self.logger.error("数据库受损，无法打开")
+            self.logger.debug("详细错误：%s" %db.lastError().text())
+            raise RuntimeError("数据库受损")
+        elif db.transaction()==False:
+            self.logger.error("启动数据库事务失败")
+            self.logger.debug("详细错误：%s" %db.lastError().text())
+            raise RuntimeError("数据库事务启动失败")
         self.logger.debug("已启动数据库连接")
+        self.query=QSqlQuery(db=db)
         whitelist_mode=["5f71e934bcdbf3a8c3ba51d9","5f71e934bcdbf3a8c3ba51da"]
         # 不应该休眠的模式的白名单列表
+        tables=db.tables()
+        if "ALL_ANSWERS" not in tables or len(tables)>1:
+            self.logger.info("正在更新数据库到新版文件")
+            shutil.copy("answers.db","answers.db.bak")
+            self.logger.info("旧版数据库备份为answers.db.bak")
+            self.logger.debug("全部旧数据表：%s" %tables)
+            self.query.exec("CREATE TABLE 'ALL_ANSWERS' (QUESTION TEXT NOT NULL UNIQUE,ANSWER TEXT NOT NULL)")
+
+            for table in tables:
+                self.logger.debug("正在插入 %s 的旧数据到新表中" %table)
+                self.query.exec("INSERT OR IGNORE INTO 'ALL_ANSWERS' SELECT * FROM '%s'" %table)
+                self.logger.debug("正在删除旧数据表")
+                self.query.exec("DROP TABLE '%s'" %table)
+            db.commit()
         try:
             for key in self.ids.keys():
                 title=self.ids[key]["title"]
                 enabled=self.ids[key]["enabled"]
-                times=self.ids[key]["times"]
+                if times==None:
+                    times=self.ids[key]["times"]
                 if key in whitelist_mode:
                     sleepflag=False
                     self.logger.debug("key=%s 关闭答题睡眠" %key)
@@ -374,7 +429,9 @@ class TestProcessor():
                     self.logger.debug("key=%s 启用答题睡眠" %key)
                 if enabled==True:
                     for i in range(times):
-                        self.logger.info("正在处理第 %d 次的 %s" %(i+1,title))
+                        msg="正在处理第 %d 次的 %s" %(i+1,title)
+                        self.logger.info(msg)
+                        update_tray.emit(msg)
                         try:
                             self.process(mode_id=key,sleep=sleepflag)
                         except requests.exceptions.ConnectionError as e:
@@ -393,10 +450,15 @@ class TestProcessor():
         finally:
             self.session.close()
             self.logger.debug("已关闭Session")
-            conn.commit()
-            self.cur.close()
-            conn.close()
-            self.logger.debug("已关闭数据库连接")
+            self.query.finish()
+            self.query.clear()
+            if db.commit()==True:
+                self.logger.debug("提交数据库更改成功")
+            else:
+                self.logger.error("提交数据库更改失败，正在回滚更改")
+                db.rollback()
+            db.close()
+            self.logger.info("已关闭数据库连接")
             with open(file="config.json",mode="r",encoding="utf-8") as reader:
                 conf=json.loads(reader.read())
             conf["auth"]={"token":self.token,"refresh_token":self.refresh_token,"uid":self.uid}
@@ -405,16 +467,22 @@ class TestProcessor():
             self.logger.debug("已更新Token数据供下次使用")
     @retry(wait=wait_fixed(2)+wait_random(0,3),retry=retry_if_exception_type(requests.exceptions.ConnectionError),stop=stop_after_attempt(5),reraise=True)
     def process(self,mode_id:str,sleep:bool=True):
-        headers={"Referer":"https://ssxx.univs.cn/client/exam/%s/1/1/%s" %(self.activity_id,mode_id),}
+        headers={"Referer":"https://%s.univs.cn/client/exam/%s/1/1/%s" %(self.prefix,self.activity_id,mode_id),}
         self.session.headers.update(headers)
         params={"t":str(int(time.time())),"activity_id":self.activity_id,"mode_id":mode_id,"way":self.conf["way"]}
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/race/beginning/",params=params).json()
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/race/beginning/" %self.prefix,params=params).json()
         self.logger.debug("获取题目数据：%s" %json_response)
         if json_response["code"]==1005:
             self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
             raise RuntimeError("检测到此账号在其他客户端登陆")
+        elif json_response["code"]==4832:
+            self.logger.error("超过允许答题次数")
+            if self.prefix=="dsjd":
+                self.logger.info("你正在使用党史答题，党史答题每天只有一次机会")
+            raise RuntimeError("超过最大允许答题次数")
         elif json_response["code"]!=0:
-            self.logger.error("服务器返回错误代码：%d，错误信息：%s" %(json_response["code"],json_response["message"]))
+            msg=self.error_handler(json_response=json_response)
+            self.logger.error("服务器返回错误代码：%d，错误信息：%s" %(json_response["code"],msg))
             raise RuntimeError("开始答题过程中服务器返回数据有误，查看日志获得更多信息")
         question_ids=json_response["question_ids"]
         num=0
@@ -444,14 +512,16 @@ class TestProcessor():
                 FailNum=FailNum+1
                 self.logger.info("第 %d 道题目失败" %(i+1))
         race_code=json_response["race_code"]
-        self.finish(race_code=race_code,activity_id=self.activity_id,mode_id=mode_id,n=n)
+        self.finish(race_code=race_code,activity_id=self.activity_id,mode_id=mode_id)
         self.logger.info("此次成功查询 %d 个题，收录 %d 个题" %(SuccessNum,FailNum))
-    def normal_choice_pos(self,lst:list):
+    def normal_choice_pos(self,lst:list,max_:int=None):
         mu=(len(lst)-1)/2
         sigma=len(lst)/6
+        if max_==None:
+            max_=len(lst)-1
         while True:
             index=int(random.normalvariate(mu=mu,sigma=sigma))
-            if 0<=index<len(lst):
+            if index in range(max_):
                 self.logger.debug("选中需要模拟验证的位置：%d" %index)
                 return index
     def check_verify(self,mode_id:str,n:str):
@@ -462,7 +532,7 @@ class TestProcessor():
         code=self.encrypt_with_pubkey(string=n,time_=timestamp)
         self.logger.debug("save_code=%s" %code)
         post_data={"activity_id":self.activity_id,"mode_id":mode_id,"way":self.conf["way"],"code":code}
-        json_response=self.session.post("https://ssxx.univs.cn/cgi-bin/check/verification/code/",json=post_data).json()
+        json_response=self.session.post("https://%s.univs.cn/cgi-bin/check/verification/code/" %self.prefix,json=post_data).json()
         return bool(json_response["status"])
     def submit_verify(self,mode_id:str,n:str):
         # n为验证码字符串
@@ -470,23 +540,27 @@ class TestProcessor():
         code=self.encrypt_with_pubkey(string=n,time_=int(time_))
         self.logger.debug("submit_code=%s" %code)
         post_data={"activity_id":self.activity_id,"mode_id":mode_id,"way":self.conf["way"],"code":code}
-        json_response=self.session.post("https://ssxx.univs.cn/cgi-bin/save/verification/code/",json=post_data).json()
+        json_response=self.session.post("https://%s.univs.cn/cgi-bin/save/verification/code/" %self.prefix,json=post_data).json()
         self.logger.debug("submit_response=%s" %json_response)
-        if json_response["code"]==1005:
-            self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
-            raise RuntimeError("检测到此账号在其他客户端登陆")
-        elif json_response["code"]!=0:
-            self.logger.error("提交验证码失败")
-        else:
+        if json_response["code"]==0:
             self.logger.info("提交验证码成功")
+        elif json_response["code"]==1005:
+            self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
+            raise RuntimeError("检测到此账号在其他客户端登陆")
+        else:
+            msg=self.error_handler(json_response=json_response)
+            self.logger.error("提交验证码失败，错误代码：%d，服务器返回信息：%s" %(json_response["code"],msg))
     def get_option(self,activity_id,question_id,mode_id,n:str,veryfy:bool=False):
+        if self.prefix not in ["ssxx"]:
+            veryfy=False
         params={"t":str(int(time.time())),"activity_id":activity_id,"question_id":question_id,"mode_id":mode_id,"way":self.conf["way"]}
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/race/question/",params=params).json()
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/race/question/" %self.prefix,params=params).json()
         if json_response["code"]==1005:
             self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
             raise RuntimeError("检测到此账号在其他客户端登陆")
         elif json_response["code"]!=0:
-            self.logger.error("服务器返回错误代码：%d，信息：%s" %(json_response["code"],json_response["message"]))
+            msg=self.error_handler(json_response=json_response)
+            self.logger.error("服务器返回错误代码：%d，信息：%s" %(json_response["code"],msg))
             raise RuntimeError("获取题目过程中服务器返回数据有误，查看日志文件获得更多信息")
         self.logger.debug("获取选项信息：%s" %json_response)
         if veryfy==True:
@@ -510,7 +584,7 @@ class TestProcessor():
         # 题目
         title=self.clean_element(string_=json_response['data']['title'])
         self.logger.info("题目：%s" %title)
-        answer=self.search_ans(mode_id=mode_id,question=title)
+        answer=self.search_ans(question=title)
         self.logger.debug("选择项目：%s" %op_result)
         if answer!=[]:
             self.logger.info("来自数据库的答案：%s" %answer)
@@ -535,32 +609,22 @@ class TestProcessor():
                     answer_str=answer_titles[0]
                 else:
                     answer_str="#".join(answer_titles)
-                self.update_database(question=title,mode_id=mode_id,answer=answer_str)
+                self.update_database(question=title,answer=answer_str)
                 self.logger.info("捕获正确答案并更新数据库成功")
             else:
                 raise RuntimeError("捕获答案出错，查看日志以获得更多信息")
-    def update_database(self,question:str,mode_id:str,answer:str):
-        self.logger.debug("正在加入条目 QUESTION=%s,ANSWER=%s 到表%s中" %(question,answer,mode_id))
-        try:
-            res=self.cur.execute("SELECT ANSWER FROM '%s' WHERE QUESTION='%s'" %(mode_id,question)).fetchone()
-        except sqlite3.OperationalError:
-            self.logger.error("查询数据库失败，正在尝试创建表")
-            try:
-                self.cur.execute("CREATE TABLE '%s' (QUESTION TEXT NOT NULL UNIQUE,ANSWER TEXT NOT NULL)" %mode_id)
-            except sqlite3.OperationalError:
-                self.logger.error("数据库内已存在表，数据库受损？")
+    def update_database(self,question:str,answer:str):
+        self.logger.debug("正在加入条目 QUESTION=%s,ANSWER=%s 到表ALL_ANSWERS中" %(question,answer))
+        if self.query.exec("INSERT OR REPLACE INTO 'ALL_ANSWERS' (QUESTION,ANSWER) VALUES ('%s','%s')" %(question,answer))==False:
+            self.logger.error("插入数据库失败，原因：%s，正在尝试创建表" %self.query.lastError().text())
+            if self.query.exec("CREATE TABLE 'ALL_ANSWERS' (QUESTION TEXT NOT NULL UNIQUE,ANSWER TEXT NOT NULL)")==False:
+                self.logger.error("创建表失败，原因：%s，数据库受损？" %self.query.lastError().text())
                 raise RuntimeError("数据库已受损，需要手动修复")
             else:
-                self.cur.execute("INSERT INTO '%s' (QUESTION,ANSWER) VALUES ('%s','%s')" %(mode_id,question,answer))
+                self.query.exec("INSERT INTO 'ALL_ANSWERS' (QUESTION,ANSWER) VALUES ('%s','%s')" %(question,answer))
                 self.logger.debug("已创建表并加入数据库条目")
         else:
-            self.logger.debug("search_result=%s" %res)
-            if res==None:
-                self.cur.execute("INSERT INTO '%s' (QUESTION,ANSWER) VALUES ('%s','%s')" %(mode_id,question,answer))
-                self.logger.debug("已加入数据库条目")
-            else:
-                self.cur.execute("UPDATE '%s' SET QUESTION = '%s', ANSWER = '%s'" %(mode_id,question,answer))
-                self.logger.debug("已更新数据库条目")
+            self.logger.debug("已更新数据库条目")
     def process_ans(self,question_id:str,activity_id:str,mode_id:str,answer_ids:list,catch:bool=False):
         data={"activity_id":activity_id,"question_id":question_id,"answer":None,"mode_id":mode_id,"way":self.conf["way"]}
         if catch==True:
@@ -570,7 +634,7 @@ class TestProcessor():
             data["answer"]=answer_ids
             prefix="submit"
         self.logger.debug("data=%s" %data)
-        json_response=self.session.post("https://ssxx.univs.cn/cgi-bin/race/answer/",json=data).json()
+        json_response=self.session.post("https://%s.univs.cn/cgi-bin/race/answer/" %self.prefix,json=data).json()
         self.logger.debug("%s_response=%s" %(prefix,json_response))
         if json_response["code"]==0 and catch==True:
             return json_response["data"]["correct_ids"]
@@ -580,7 +644,8 @@ class TestProcessor():
             self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
             raise RuntimeError("检测到此账号在其他客户端登陆")
         elif json_response["code"]!=0:
-            self.logger.error("服务器返回错误代码：%d，信息：%s" %(json_response["code"],json_response["message"]))
+            msg=self.error_handler(json_response=json_response)
+            self.logger.error("服务器返回错误代码：%d，信息：%s" %(json_response["code"],msg))
             raise RuntimeError("答题过程中服务器返回数据有误，查看日志获得更多信息")
     def clean_element(self,string_:str):
         # 清除元素中不显示（contains(@style,display:none)）的部分以获得正常的题目和选项
@@ -595,26 +660,35 @@ class TestProcessor():
                 cleaned=cleaned+1
         self.logger.debug("共清理 %d 个干扰元素" %cleaned)
         return soup.get_text().strip()
-    def search_ans(self,mode_id:str,question:str):
+    def search_ans(self,question:str):
         # 数据要求：一个问题对应一个答案，整张表内应该不存在同名问题，
         # 多个答案用#组合为一个字符串，查询时将自动按#切割为列表，无答案返回空列表
-        try:
-            res=self.cur.execute("SELECT ANSWER from '%s' WHERE QUESTION='%s'" %(mode_id,question)).fetchone()
-        except sqlite3.OperationalError:
-            self.logger.error("查询SQL数据库出错")
+        self.query.exec("SELECT COUNT(ANSWER) FROM 'ALL_ANSWERS' WHERE QUESTION='%s'" %(question))
+        self.query.last()
+        if int(self.query.value(0))!=0:
+            self.logger.debug("找到 %d 个的答案" %int(self.query.value(0)))
+            # 答案数应当永远为 1
+            if self.query.exec("SELECT ANSWER from 'ALL_ANSWERS' WHERE QUESTION='%s'" %(question))==False:
+                self.logger.error("查询SQL数据库出错，原因：%s" %self.query.lastError().text())
+            else:
+                self.query.last()
+                value=self.query.value(0)
+                self.logger.debug("查询得到的值：%s" %value)
+                return str(value).split("#")
         else:
-            if res!=None:
-                return str(res[0]).split("#")
+            self.logger.debug("未找到答案")
         return []
-    def finish(self,activity_id:str,mode_id:str,race_code:str,n:str):
+    def finish(self,activity_id:str,mode_id:str,race_code:str):
         payload={
             "race_code":race_code
         }
-        json_response=self.session.post("https://ssxx.univs.cn/cgi-bin/race/finish/",json=payload).json()
+        json_response=self.session.post("https://%s.univs.cn/cgi-bin/race/finish/" %self.prefix,json=payload).json()
         self.logger.debug(json_response)
         if json_response["code"]==4823:
+            n="".join(random.choices(string.ascii_letters+string.digits,k=4))
+            self.check_verify(mode_id=mode_id,n=n)
             self.submit_verify(mode_id=mode_id,n=n)
-            self.finish(activity_id=activity_id,mode_id=mode_id,race_code=race_code,n=n)
+            self.finish(activity_id=activity_id,mode_id=mode_id,race_code=race_code)
         elif json_response["code"]==0:
             owner=json_response["data"]["owner"]
             self.logger.info("执行完成，正确数：%d，答题用时：%d 秒" %(owner["correct_amount"],owner["consume_time"]))
@@ -622,7 +696,7 @@ class TestProcessor():
                 opponent=json_response["data"]["opponent"]
                 self.logger.info("处于对战模式，对方信息：来自 %s 的 %s，正确数 %d，用时 %d秒" %(opponent["univ_name"],opponent["name"],opponent["correct_amount"],opponent["consume_time"]))
         elif json_response["code"]==4831:
-            self.logger.error("答题用时过短")
+            self.logger.warning("答题用时过短")
         elif json_response["code"]==1005:
             self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
             raise RuntimeError("检测到此账号在其他客户端登陆")
@@ -632,26 +706,50 @@ class TestProcessor():
         self.logger.debug("正在更新得分情况")
         self.update_info_signal.emit(self.get_user_info())
         if self.expire-time.time()<500:
+            self.logger.warning("Token还有 %d 秒即将过期" %(self.expire-time.time()))
             self.update_token()
     def encrypt_with_pubkey(self,string:str,time_:int=int(time.time())):
         params={"t":time_}
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/base/public/key/",params=params).json()
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/base/public/key/" %self.prefix,params=params).json()
         pubkey=RSA.import_key(json_response["data"]["public_key"])
         cipher=Cipher.new(pubkey)
         return base64.b64encode(cipher.encrypt(string.encode())).decode()
-    def bootstrap(self,tray:QSystemTrayIcon,times:int=30):
+    def bootstrap(self,update_tray:pyqtBoundSignal,tray:QSystemTrayIcon,times:int=30):
         # 初始化题目数据库，建议使用小号
+        if QSqlDatabase.contains("qt_sql_default_connection"):
+            db=QSqlDatabase.database("qt_sql_default_connection")
+        else:
+            db=QSqlDatabase.addDatabase("QSQLITE")
+        db.setDatabaseName("answers.db")
+        if db.open()==False:
+            self.logger.error("数据库受损，无法打开")
+            self.logger.debug("详细错误：%s" %db.lastError().text())
+            raise RuntimeError("数据库受损")
+        elif db.transaction()==False:
+            self.logger.error("启动数据库事务失败")
+            self.logger.debug("详细错误：%s" %db.lastError().text())
+            raise RuntimeError("数据库事务启动失败")
+        self.logger.debug("已启动数据库连接")
+        self.query=QSqlQuery(db=db)
+        self.query.exec("CREATE TABLE 'ALL_ANSWERS' (QUESTION TEXT NOT NULL UNIQUE,ANSWER TEXT NOT NULL)")
         self.logger.info("正在初始化题目数据库，强烈建议使用无关小号登陆")
         self.logger.info("每个挑战将刷 %d 次以获得足够的数据" %times)
         try:
             for key in self.ids.keys():
                 for i in range(times):
+                    msg="正在第 %d 次获取答案数据库" %(i+1)
+                    self.logger.info(msg)
+                    update_tray.emit(msg)
                     self.process(mode_id=key,sleep=False)
         except RuntimeError as e:
             self.logger.error("处理过程出现错误")
             self.logger.debug("错误详细内容：%s" %e)
             tray.showMessage("ChinaUniOnlineGUI：错误",str(e),QSystemTrayIcon.MessageIcon.Critical)
         else:
+            self.query.finish()
+            self.query.clear()
+            db.commit()
+            db.close()
             self.logger.info("初始化数据库成功")
     def get_token(self):
         with open(file="config.json",mode="r",encoding="utf-8") as reader:
@@ -662,17 +760,17 @@ class TestProcessor():
         self.logger.debug("Token=%s,refresh_token=%s,uid=%s" %(token,refresh_token,uid))
         return token,refresh_token,uid
     def update_token(self):
-        json_response=self.session.get("https://ssxx.univs.cn/cgi-bin/authorize/token/refresh/").json()
+        json_response=self.session.get("https://%s.univs.cn/cgi-bin/authorize/token/refresh/" %self.prefix).json()
         self.logger.debug("返回数据：%s" %json_response)
         if json_response["code"]==0:
             self.token=json_response["token"]
-            self.session.headers.update({"Authorize":"Bearer %s" %self.token})
+            self.session.headers.update({"Authorization":"Bearer %s" %self.token})
             self.logger.info("更新Token成功")
             self.expire=self.decode_token()[self.token.split(".")[1]]["exp"]
         elif json_response["code"]==1005:
             self.logger.error("用户在其他地方登陆，当前客户端被迫下线")
         else:
-            self.logger.error("更新Token失败,服务器返回信息：%s" %json_response["message"])
+            self.logger.error("更新Token失败,服务器返回信息：%s" %self.error_handler(json_response=json_response))
     def decode_token(self,token:str=""):
         # 原理来自https://github.com/deximy/FxxkSsxx
         if token=="":
@@ -688,7 +786,18 @@ class TestProcessor():
             else:
                 self.logger.debug("分片解码完成")
         return result
+    def error_handler(self,json_response:dict):
+        if "message" in json_response.keys():
+            msg=json_response["message"]
+        elif "msg" in json_response.keys():
+            msg=json_response["msg"]
+        else:
+            msg="(无)"
+        self.logger.error("服务器返回信息：%s" %msg)
+        return msg
 class Work(QObject):
+    close_dock_signal=pyqtSignal()
+    update_tray=pyqtSignal(str)
     def __init__(self,show_qr_signal:pyqtBoundSignal,finish_signal:pyqtBoundSignal,close_qr_signal:pyqtBoundSignal,tray:QSystemTrayIcon,user_info_signal:pyqtBoundSignal,update_info_signal:pyqtBoundSignal):
         super().__init__()
         self.finish_signal=finish_signal
@@ -700,12 +809,18 @@ class Work(QObject):
         self.logger=logging.getLogger(__name__)
     def start(self):
         self.logger.debug("正在启动子线程")
-        self.processor=TestProcessor(show_qr_signal=self.show_qr_signal,close_qr_signal=self.close_qr_signal,user_info_signal=self.user_info_signal,update_info_signal=self.update_info_signal)
-        self.logger.debug("已实例化处理类")
-        self.processor.start(tray=self.tray)
+        self.processor=TestProcessor(show_qr_signal=self.show_qr_signal,close_qr_signal=self.close_qr_signal,user_info_signal=self.user_info_signal,update_info_signal=self.update_info_signal,prefix="ssxx")
+        self.logger.debug("已实例化四史处理类")
+        self.processor.start(tray=self.tray,update_tray=self.update_tray)
+        self.close_dock_signal.emit()
+        self.processor_new=TestProcessor(show_qr_signal=self.show_qr_signal,close_qr_signal=self.close_qr_signal,user_info_signal=self.user_info_signal,update_info_signal=self.update_info_signal,prefix="dsjd")
+        self.logger.debug("已实例化党史处理类")
+        self.processor_new.start(tray=self.tray,update_tray=self.update_tray)
         self.finish_signal.emit()
         self.logger.debug("已提交终止信号")
 class BootStrap(QObject):
+    close_dock_signal=pyqtSignal()
+    update_tray=pyqtSignal(str)
     def __init__(self,show_qr_signal:pyqtBoundSignal,finish_signal:pyqtBoundSignal,close_qr_signal:pyqtBoundSignal,tray:QSystemTrayIcon,user_info_signal:pyqtBoundSignal,update_info_signal:pyqtBoundSignal,times:int=30):
         super().__init__()
         self.logger=logging.getLogger(__name__)
@@ -718,9 +833,13 @@ class BootStrap(QObject):
         self.tray=tray
     def start(self):
         self.logger.debug("正在启动子线程")
-        self.processor=TestProcessor(show_qr_signal=self.show_qr_signal,close_qr_signal=self.close_qr_signal,user_info_signal=self.user_info_signal,update_info_signal=self.update_info_signal)
-        self.logger.debug("已实例化处理类")
-        self.processor.bootstrap(times=self.times,tray=self.tray)
+        self.processor=TestProcessor(show_qr_signal=self.show_qr_signal,close_qr_signal=self.close_qr_signal,user_info_signal=self.user_info_signal,update_info_signal=self.update_info_signal,prefix="ssxx")
+        self.logger.debug("已实例化四史处理类")
+        self.processor.bootstrap(times=self.times,tray=self.tray,update_tray=self.update_tray)
+        self.close_dock_signal.emit()
+        self.processor_new=TestProcessor(show_qr_signal=self.show_qr_signal,close_qr_signal=self.close_qr_signal,user_info_signal=self.user_info_signal,update_info_signal=self.update_info_signal,prefix="dsjd")
+        self.logger.debug("已实例化党史处理类")
+        self.processor_new.bootstrap(times=self.times,tray=self.tray,update_tray=self.update_tray)
         self.finish_signal.emit()
         self.logger.debug("已提交终止信号")
 class SettingWindow(QDialog):
@@ -841,13 +960,13 @@ class SettingWindow(QDialog):
         show_user_info.setStyleSheet(theme["check_box"])
         show_user_info.setObjectName("show_user_info")
         for widget in [proxy,theme_group,debug_check,way,hide,show_user_info,auth]:
+            self.content.addWidget(widget,x,y)
+            self.logger.debug("已添加额外部件 %s 于(%d,%d)" %(widget.objectName(),x,y))
             if y+1>=self.shape:
-                y=0
                 x=x+1
+                y=0
             else:
                 y=y+1
-                x=x
-            self.content.addWidget(widget,x,y)
         layout.addLayout(self.content,1,1)
     def close_callback(self):
         self.save_settings()
@@ -910,8 +1029,13 @@ class SettingWindow(QDialog):
             times_label.setStyleSheet(theme["label"])
             times_input=EnhancedEdit()
             times_input.setObjectName(key)
-            times_input.setText(str(conf_times))
-            times_input.setToolTip("仅限正整数，过多的次数（>50次/项）可能导致掉登陆")
+            if times_input.objectName()=="party_history":
+                times_input.setText("1")
+                times_input.setEnabled(False)
+                times_input.setToolTip("党史每天只能做一次")
+            else:
+                times_input.setText(str(conf_times))
+                times_input.setToolTip("仅限正整数，过多的次数（>50次/项）可能导致掉登陆")
             times_input.setValidator(QRegularExpressionValidator(QRegularExpression("^[1-9][0-9]{1,8}$")))
             times_input.setStyleSheet(theme["line_edit"])
             times.addWidget(times_label)
@@ -927,6 +1051,7 @@ class SettingWindow(QDialog):
                 x=x+1
                 y=0
             layout.addWidget(group,x,y)
+            self.logger.debug("已放置部件 %s 于(%d,%d)" %(group.objectName(),x,y))
             y=y+1
         self.logger.debug("最后的元素位置：(%d,%d)" %(x,y))
         return (x,y)
@@ -1104,6 +1229,11 @@ class UI(QMainWindow):
                 "title":"抢十赛",
                 "enabled":True,
                 "times":1
+            },
+            "party_history":{
+                "title":"党史活动",
+                "enabled":True,
+                "times":1
             }
         }
         if os.path.exists("config.json")==False:
@@ -1131,16 +1261,19 @@ class UI(QMainWindow):
         self.setWindowFlag(Qt.WindowFlags.FramelessWindowHint)
         self.setAutoFillBackground(True)
         self.setWindowIcon(QIcon(self.theme.icon))
+        self.setWindowTitle("ChinaUniOnlineGUI")
         self.tray=QSystemTrayIcon()
         self.tray.setIcon(QIcon(self.theme.tray))
-        self.tray.setToolTip("ChinaUniOnlineGUI")
+        self.tray.setToolTip(self.windowTitle()+"\n当前状态：未开始")
         self.tray.activated.connect(self.tray_func)
         self.work=Work(show_qr_signal=self.show_qr_signal,finish_signal=self.finish_signal,close_qr_signal=self.close_qr_signal,tray=self.tray,user_info_signal=self.user_info_signal,update_info_signal=self.update_info_signal)
+        self.work.close_dock_signal.connect(self.close_dock)
+        self.work.update_tray.connect(lambda s: self.tray.setToolTip(self.windowTitle()+"\n当前状态："+s))
         self.work_thread=QThread()
         self.work.moveToThread(self.work_thread)
         self.main_layout=QGridLayout()
         central_widget.setLayout(self.main_layout)
-        self.title=QLabel("ChinaUniOnlineGUI")
+        self.title=QLabel(self.windowTitle())
         self.title.setStyleSheet(self.theme.title)
         self.title.setAlignment(Qt.Alignment.AlignCenter)
         handler.widget.setStyleSheet(self.theme.logger)
@@ -1227,10 +1360,10 @@ class UI(QMainWindow):
             self.avatar=UserAvatar(parent=self,name=info["name"],phone=info["phone"],score=info["integral"],times=info["join_times"],t_score=info["t_integral"],t_times=info["t_join_times"],school=info["university_name"],avatar=self.draw_pic(data=info["avatar"]),province_name=info["province_name"])
             self.avatar.resize(int(self.width()*(200/1024)),int(self.height()*(200/1024)))
             self.avatar.setStyleSheet(self.theme.avatar)
-            dock=QDockWidget("当前登陆用户信息：",self)
-            dock.setWidget(self.avatar)
-            dock.setStyleSheet(self.theme.dock)
-            self.addDockWidget(Qt.DockWidgetAreas.RightDockWidgetArea,dock)
+            self.dock=QDockWidget("当前登陆用户信息：",self)
+            self.dock.setWidget(self.avatar)
+            self.dock.setStyleSheet(self.theme.dock)
+            self.addDockWidget(Qt.DockWidgetAreas.RightDockWidgetArea,self.dock)
     def draw_pic(self,data:list):
         self.logger.debug("获取图片信息：%s" %data)
         titles=list()
@@ -1277,6 +1410,8 @@ class UI(QMainWindow):
     def bootstrap(self):
         bootstrap_thread=QThread()
         bootstrap=BootStrap(show_qr_signal=self.show_qr_signal,finish_signal=self.finish_signal,close_qr_signal=self.close_qr_signal,tray=self.tray,user_info_signal=self.user_info_signal,update_info_signal=self.update_info_signal)
+        bootstrap.close_dock_signal.connect(self.close_dock)
+        bootstrap.update_tray.connect(lambda s: self.tray.setToolTip(self.windowTitle()+"\n当前状态："+s))
         bootstrap.moveToThread(bootstrap_thread)
         bootstrap_thread.started.connect(bootstrap.start)
         bootstrap_thread.finished.connect(self.finish_bootstrap)
@@ -1324,6 +1459,7 @@ class UI(QMainWindow):
         self.logger.info("执行完成，共计用时 {:0>2d}:{:0>2d}:{:0>2d}".format(int(hours),int(mins),int(secs)))
         if self.isVisible()==False:
             self.tray.showMessage("ChinaUniOnline:任务执行完成","共计用时 {:0>2d}:{:0>2d}:{:0>2d}".format(int(hours),int(mins),int(secs)),QSystemTrayIcon.MessageIcon.Information)
+        self.tray.setToolTip(self.windowTitle()+"\n当前状态：已完成")
     def show_qr(self,qr:bytes):
         title_label=QLabel("请使用微信扫描小程序码完成登陆")
         title_label.setStyleSheet(self.theme.qr_title)
@@ -1358,11 +1494,14 @@ class UI(QMainWindow):
             else:
                 need_update=True
                 self.logger.debug("正在将 %s 的默认值应用到旧版数据上" %key)
-                if type(new_conf[key])!=dict:
+                if type(new_conf[key])!=dict or key not in conf.keys():
                     conf[key]=new_conf[key]
                 else:
                     self.update_conf(conf=conf[key],new_conf=new_conf[key],write=False)
-        self.logger.debug("更新后的配置：%s" %conf)
+        if need_update==True:
+            self.logger.debug("更新后的配置：%s" %conf)
+        else:
+            self.logger.debug("无需更新配置文件")
         if write==True and need_update==True:
             self.logger.info("旧版配置已备份为 config.json.bak")
             shutil.copy("config.json","config.json.bak")
@@ -1373,6 +1512,8 @@ class UI(QMainWindow):
         with open(file="config.json",mode="w",encoding="utf-8") as conf_writer:
             conf_writer.write(json.dumps(self.default_conf,indent=4,sort_keys=True,ensure_ascii=False))
         self.logger.info("已生成默认配置文件")
+    def close_dock(self):
+        self.removeDockWidget(self.dock)
     def mousePressEvent(self, event:QMouseEvent):
         self.logger.debug("触发鼠标按压事件")
         super().mousePressEvent(event)
